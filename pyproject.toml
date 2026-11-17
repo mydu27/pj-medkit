@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pj-medkit"
+dynamic = ["version"]
+description = "医学影像公共工具包：CT 期相识别等通用方法，供各项目统一调用"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["loguru>=0.7.3", "pydicom>=3.0.2"]
+
+[tool.setuptools]
+packages = ["pj_medkit"]
+
+[tool.setuptools.dynamic]
+version = { attr = "pj_medkit.__version__" }
