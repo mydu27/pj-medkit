@@ -8,7 +8,7 @@
 
 |我想做什么|用哪个模块|提供的函数|文档|
 |:---|:---|:---|:---|
-|判断 CT 检查里各序列是平扫、动脉期、静脉期还是延迟期|`pj_medkit.phase`|`classify_dir()`、`classify_phases()`、`read_series_header()`|[期相识别](docs/期相识别.md)|
+|判断 CT 检查里各序列是平扫、动脉期、静脉期还是延迟期|`pj_medkit.phase`|`classify_dir()`、`classify_phases()`、`guess_phases()`、`read_series_header()`|[期相识别](docs/期相识别.md)|
 
 每个模块一篇文档，都在 [docs/](docs/) 目录下。各版本改了什么见 [CHANGELOG.md](CHANGELOG.md)。
 
@@ -39,13 +39,13 @@ result = classify_dir("/data/检查目录")
 # {
 #     "rule_version": 1,
 #     "series": [
-#         {"series_uid": "1.2.840...", "series_number": 2, "description": "Abdomen", "phase": 0},
-#         {"series_uid": "1.2.840...", "series_number": 3, "description": "Abdomen A", "phase": 1},
+#         {"series_uid": "1.2.840...", "series_number": 2, "description": "Abdomen", "phase": 0, "guessed": False},
+#         {"series_uid": "1.2.840...", "series_number": 3, "description": "Abdomen A", "phase": 1, "guessed": False},
 #     ],
 # }
 ```
 
-期相编码：0 平扫，1 动脉期，2 静脉期，3 延迟期；判断不了为 `None`。详细用法和判断规则见 [docs/期相识别.md](docs/期相识别.md)。
+期相编码：0 平扫，1 动脉期，2 静脉期，3 延迟期；判断不了为 `None`。每个序列都必须有期相时传 `fallback=True`，判断不了的按扫描先后补一个，补的 `guessed` 为 `True`。详细用法和判断规则见 [docs/期相识别.md](docs/期相识别.md)。
 
 ## 目录结构
 

@@ -4,8 +4,8 @@ from pydicom.uid import ExplicitVRLittleEndian
 from pydicom.dataset import Dataset, FileMetaDataset
 from pj_medkit.phase import (PHASE_PLAIN, PHASE_DELAY, PHASE_VENOUS,
                              PHASE_ARTERIAL, PHASE_RULE_VERSION,
-                             _dicom_seconds, classify_dir, classify_phases,
-                             read_series_header)
+                             _dicom_seconds, classify_dir, guess_phases,
+                             classify_phases, read_series_header)
 
 # 08:00:00 的当天秒数，用例里的采集时间都在它之后
 T0 = 8 * 3600
@@ -235,6 +235,119 @@ def test_no_contrast_field_missing_acquisition_time_gives_nothing():
     assert classify_phases(series) == {}
 
 
+def _guess(series, liver_hu=None) -> tuple[dict, dict]:
+    phases = classify_phases(series, liver_hu)
+    return phases, guess_phases(series, phases)
+
+
+def test_guess_nothing_when_all_determined():
+    series = [
+        _series("1", False, T0),
+        _series("2", True, T0 + 130, bolus=T0 + 100),
+    ]
+    assert _guess(series) == ({"1": PHASE_PLAIN, "2": PHASE_ARTERIAL}, {})
+
+
+def test_guess_single_enhanced_is_venous():
+    series = [_series("1", False, T0), _series("2", True, T0 + 100)]
+    assert _guess(series) == ({"1": PHASE_PLAIN}, {"2": PHASE_VENOUS})
+    # 没有平扫、只有一个增强序列也一样
+    assert _guess(series[1:]) == ({}, {"2": PHASE_VENOUS})
+
+
+def test_guess_two_enhanced_by_acquisition_order():
+    series = [
+        _series("1", False, T0),
+        _series("3", True, T0 + 200),
+        _series("2", True, T0 + 100),
+    ]
+    assert _guess(series) == ({
+        "1": PHASE_PLAIN
+    }, {
+        "2": PHASE_ARTERIAL,
+        "3": PHASE_VENOUS
+    })
+
+
+def test_guess_no_contrast_field_earliest_is_plain():
+    series = [
+        _series("1", acq=T0),
+        _series("2", acq=T0 + 100),
+        _series("3", acq=T0 + 160),
+        _series("4", acq=T0 + 300),
+        _series("5", acq=T0 + 600),
+    ]
+    assert _guess(series) == ({
+        "1": PHASE_PLAIN
+    }, {
+        "2": PHASE_ARTERIAL,
+        "3": PHASE_VENOUS,
+        "4": PHASE_DELAY,
+        "5": PHASE_DELAY,
+    })
+    # 只剩一个判断不了的，按单个增强序列处理
+    assert _guess(series[:2]) == ({"1": PHASE_PLAIN}, {"2": PHASE_VENOUS})
+
+
+def test_guess_no_contrast_field_all_marked_enhanced_has_no_plain():
+    series = [
+        _series("1", acq=T0, desc="Abdomen A"),
+        _series("2", acq=T0 + 60, desc="Abdomen P"),
+    ]
+    assert _guess(series) == ({}, {"1": PHASE_ARTERIAL, "2": PHASE_VENOUS})
+
+
+def test_guess_missing_acquisition_time_uses_given_order():
+    # 整例没填造影剂字段又缺采集时间：按传入顺序，第一个补为平扫
+    series = [
+        _series("1", acq=T0 + 500),
+        _series("2"),
+        _series("3", acq=T0),
+    ]
+    assert _guess(series) == ({}, {
+        "1": PHASE_PLAIN,
+        "2": PHASE_ARTERIAL,
+        "3": PHASE_VENOUS,
+    })
+    # 序列描述写了增强期的，不带词的补为平扫
+    series = [
+        _series("1", desc="Abdomen A"),
+        _series("2", acq=T0, desc="Abdomen"),
+        _series("3", acq=T0 + 100, desc="Abdomen P"),
+    ]
+    assert _guess(series) == ({}, {
+        "1": PHASE_ARTERIAL,
+        "2": PHASE_PLAIN,
+        "3": PHASE_VENOUS,
+    })
+
+
+def test_guess_keeps_determined_and_fills_between():
+    # 增强序列缺采集时间时按传入顺序补位，已判出的保留
+    series = [
+        _series("1", False, T0),
+        _series("2", True, None),
+        _series("3", True, T0 + 160, bolus=T0 + 100),
+        _series("4", True, None),
+    ]
+    assert _guess(series) == ({
+        "1": PHASE_PLAIN,
+        "3": PHASE_VENOUS
+    }, {
+        "2": PHASE_ARTERIAL,
+        "4": PHASE_DELAY
+    })
+    # 不晚于后面已判出的期相
+    series[2] = _series("3", True, T0 + 130, bolus=T0 + 100)
+    assert _guess(series) == ({
+        "1": PHASE_PLAIN,
+        "3": PHASE_ARTERIAL
+    }, {
+        "2": PHASE_ARTERIAL,
+        "4": PHASE_VENOUS
+    })
+
+
 def test_read_series_header(tmp_path):
     path = tmp_path / "a.dcm"
     _write_dicom(path,
@@ -300,18 +413,23 @@ def test_classify_dir(tmp_path):
             "series_number": 2,
             "description": None,
             "phase": PHASE_PLAIN,
+            "guessed": False,
         }, {
             "series_uid": "1.2.3",
             "series_number": 3,
             "description": "动脉期",
             "phase": PHASE_ARTERIAL,
+            "guessed": False,
         }, {
             "series_uid": "1.2.4",
             "series_number": 4,
             "description": None,
             "phase": PHASE_VENOUS,
+            "guessed": False,
         }],
     }
+    # 都判得出来时，开不开兜底结果一样
+    assert classify_dir(tmp_path, fallback=True) == result
 
 
 def test_classify_dir_series_uids_and_undetermined(tmp_path):
@@ -340,9 +458,16 @@ def test_classify_dir_series_uids_and_undetermined(tmp_path):
             ] == [PHASE_PLAIN, PHASE_ARTERIAL, PHASE_VENOUS, PHASE_DELAY]
     # 只留一个增强序列：没有注药时间、肝脏 CT 值和期相名，判断不了
     part = classify_dir(tmp_path, series_uids=["1.2.2", "1.2.3"])
-    assert [(s["series_uid"], s["phase"])
-            for s in part["series"]] == [("1.2.2", PHASE_PLAIN),
-                                         ("1.2.3", None)]
+    assert [(s["series_uid"], s["phase"], s["guessed"])
+            for s in part["series"]] == [("1.2.2", PHASE_PLAIN, False),
+                                         ("1.2.3", None, False)]
+    # 开兜底后补为静脉期并标明是补的
+    part = classify_dir(tmp_path,
+                        series_uids=["1.2.2", "1.2.3"],
+                        fallback=True)
+    assert [(s["phase"], s["guessed"])
+            for s in part["series"]] == [(PHASE_PLAIN, False),
+                                         (PHASE_VENOUS, True)]
     # 补上肝脏 CT 值后能判断
     part = classify_dir(tmp_path,
                         liver_hu={

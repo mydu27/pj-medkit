@@ -233,6 +233,52 @@ def classify_phases(series: list[dict], liver_hu: dict | None = None) -> dict:
     return phases
 
 
+def guess_phases(series: list[dict], phases: dict) -> dict:
+    """
+    给 classify_phases 判断不了的序列按扫描先后强行补一个期相，series 同
+    classify_phases，phases 是它的返回值。返回 {key: 期相}，只含 phases 里没有的序列。
+    补的期相没有依据，只用于必须每个序列都有期相才能继续的场合：
+    1. 先后顺序：序列都有采集时间时按采集时间，有缺的整体按传入顺序
+    2. 判断不了的序列按增强处理。整例都没填造影剂字段时例外：序列描述里有增强期
+       用词的，不带词的补为平扫；都没有时最早的补为平扫
+    3. 增强序列按先后补位：已判出的保留，没判出的接在前一个增强期之后(动脉、静脉、
+       延迟)，且不晚于后面最近一个已判出的期相
+    4. 整例只有一个增强序列且判断不了时补为静脉期(单期增强多为静脉期)
+    """
+    if all(s["key"] in phases for s in series):
+        return {}
+    if all(s["acq"] is not None for s in series):
+        ordered = sorted(series, key=lambda s: s["acq"])
+    else:
+        ordered = list(series)
+    if any(s["contrast"] for s in series):
+        plain = []
+    else:
+        plain = [s for s in ordered if not _desc_marks_enhanced(s.get("desc"))]
+        if len(plain) == len(ordered):
+            plain = ordered[:1]
+    guessed = {s["key"]: PHASE_PLAIN for s in plain if s["key"] not in phases}
+    enhanced = [
+        s for s in ordered
+        if phases.get(s["key"], guessed.get(s["key"])) != PHASE_PLAIN
+    ]
+    if len(enhanced) == 1:
+        guessed.setdefault(enhanced[0]["key"], PHASE_VENOUS)
+        return guessed
+    # 期相编码按动脉、静脉、延迟递增，前一个加一即下一个期相
+    previous = PHASE_PLAIN
+    for i, s in enumerate(enhanced):
+        phase = phases.get(s["key"])
+        if phase is None:
+            later = next((phases[x["key"]]
+                          for x in enhanced[i + 1:] if x["key"] in phases),
+                         PHASE_DELAY)
+            phase = min(previous + 1, later)
+            guessed[s["key"]] = phase
+        previous = phase
+    return guessed
+
+
 def _scan_ct_series(dicom_dir, series_uids: list[str] | None) -> dict:
     """
     扫目录(含子目录)下的 CT 图像文件头，按 SeriesInstanceUID 分组返回 {uid: [ds]}。
@@ -270,14 +316,17 @@ def _scan_ct_series(dicom_dir, series_uids: list[str] | None) -> dict:
 
 def classify_dir(dicom_dir,
                  liver_hu: dict | None = None,
-                 series_uids: list[str] | None = None) -> dict:
+                 series_uids: list[str] | None = None,
+                 fallback: bool = False) -> dict:
     """
     判断一个检查目录(含子目录)里各 CT 序列的期相。目录里的 CT 序列都参与判断，
     序列个数会影响结果，所以要么传筛选后的目录，要么用 series_uids 指定参与的序列。
     liver_hu 为 {SeriesInstanceUID: 肝脏平均 CT 值}，没有可不传。
     每个序列取中间一层的文件头；采集时间相同的序列按序列号排先后。
     返回 {"rule_version": 规则版本, "series": [{series_uid, series_number,
-    description, phase}]}，series 按序列号排序，判断不了的序列 phase 为 None
+    description, phase, guessed}]}，series 按序列号排序。判断不了的序列 phase 为
+    None；fallback 为 True 时改为按扫描先后补一个(guess_phases，缺采集时间时按
+    序列号排先后)，补的 guessed 为 True
     """
     groups = _scan_ct_series(dicom_dir, series_uids)
     series = []
@@ -293,6 +342,7 @@ def classify_dir(dicom_dir,
     series.sort(
         key=lambda s: (s["number"] is None, s["number"] or 0, s["key"]))
     phases = classify_phases(series, liver_hu)
+    guessed = guess_phases(series, phases) if fallback else {}
     result = {
         "rule_version":
         PHASE_RULE_VERSION,
@@ -300,9 +350,13 @@ def classify_dir(dicom_dir,
             "series_uid": s["key"],
             "series_number": s["number"],
             "description": s["desc"],
-            "phase": phases.get(s["key"]),
+            "phase": phases.get(s["key"], guessed.get(s["key"])),
+            "guessed": s["key"] in guessed,
         } for s in series],
     }
     summary = {s["series_number"]: s["phase"] for s in result["series"]}
-    logger.info(f"期相识别完成: {dicom_dir} {summary}")
+    guessed_numbers = [
+        s["series_number"] for s in result["series"] if s["guessed"]
+    ]
+    logger.info(f"期相识别完成: {dicom_dir} {summary} 兜底补的序列: {guessed_numbers}")
     return result
